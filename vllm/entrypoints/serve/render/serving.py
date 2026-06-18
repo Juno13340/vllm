@@ -20,6 +20,7 @@ from vllm.entrypoints.openai.models.serving import OpenAIModelRegistry
 from vllm.entrypoints.openai.parser.harmony_utils import (
     build_harmony_preamble,
     extract_instructions_from_messages,
+    get_encoding,
     parse_chat_inputs_to_harmony_messages,
     render_for_completion,
 )
@@ -52,12 +53,16 @@ from vllm.renderers.inputs.preprocess import (
     parse_model_prompt,
     prompt_to_seq,
 )
+from vllm.sampling_params import StructuredOutputsParams
 from vllm.tool_parsers import ToolParser
+from vllm.tool_parsers.utils import get_required_tool_json_schema
 from vllm.utils import random_uuid
 from vllm.utils.mistral import is_mistral_tokenizer, is_mistral_tool_parser
 from vllm.utils.mistral import mt as _mt
 
 logger = init_logger(__name__)
+
+_HARMONY_FINAL_MESSAGE_PREFILL = "<|channel|>final<|message|>"
 
 
 class OpenAIServingRender:
@@ -165,6 +170,10 @@ class OpenAIServingRender:
             truncate_prompt_tokens=request.truncate_prompt_tokens,
         )
         params = request.to_sampling_params(max_tokens, self.default_sampling_params)
+        if self._is_harmony_required_tool_choice(request):
+            params.structured_outputs = StructuredOutputsParams(
+                json=self._harmony_required_tool_json_schema(request)
+            )
 
         request_id = f"chatcmpl-{random_uuid()}"
 
@@ -260,7 +269,9 @@ class OpenAIServingRender:
             # For GPT-OSS.
             should_include_tools = tool_dicts is not None
             conversation, engine_inputs = self._make_request_with_harmony(
-                request, should_include_tools
+                request,
+                should_include_tools,
+                prefill_final_message=self._is_harmony_required_tool_choice(request),
             )
 
         return conversation, engine_inputs
@@ -396,6 +407,8 @@ class OpenAIServingRender:
         self,
         request: ChatCompletionRequest,
         should_include_tools: bool = True,
+        *,
+        prefill_final_message: bool = False,
     ):
         """Build Harmony (GPT-OSS) messages and engine prompt from a chat request."""
         messages: list[OpenAIMessage] = []
@@ -430,9 +443,39 @@ class OpenAIServingRender:
 
         # Render prompt token ids.
         prompt_token_ids = render_for_completion(messages)
+        if prefill_final_message:
+            prompt_token_ids += get_encoding().encode(
+                _HARMONY_FINAL_MESSAGE_PREFILL, allowed_special="all"
+            )
         engine_input = tokens_input(prompt_token_ids, cache_salt=request.cache_salt)
 
         return messages, [engine_input]
+
+    def _is_harmony_required_tool_choice(
+        self,
+        request: ChatCompletionRequest,
+    ) -> bool:
+        return self.use_harmony and request.tool_choice == "required" and bool(
+            request.tools
+        )
+
+    @staticmethod
+    def _harmony_required_tool_max_items(
+        request: ChatCompletionRequest,
+    ) -> int | None:
+        if request.parallel_tool_calls is False or request.stream:
+            # The required-tool streaming path tracks one tool call at a time.
+            return 1
+        return None
+
+    def _harmony_required_tool_json_schema(
+        self,
+        request: ChatCompletionRequest,
+    ) -> dict:
+        return get_required_tool_json_schema(
+            tools=request.tools,
+            max_items=self._harmony_required_tool_max_items(request),
+        )
 
     def create_error_response(
         self,

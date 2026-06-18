@@ -7,7 +7,7 @@ import time
 from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
 from contextlib import AsyncExitStack
-from copy import copy, deepcopy
+from copy import copy
 from http import HTTPStatus
 from typing import Any, Final, cast
 
@@ -24,7 +24,6 @@ from openai.types.responses import (
 from openai.types.responses.response_output_text import Logprob, LogprobTopLogprob
 from openai.types.responses.tool import Mcp, Tool
 from openai_harmony import Message as OpenAIHarmonyMessage
-from pydantic import TypeAdapter, ValidationError
 
 from vllm import envs
 from vllm.config.utils import replace
@@ -111,7 +110,10 @@ from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers import ToolParser
 from vllm.tool_parsers.streaming import extract_required_tool_call_streaming
-from vllm.tool_parsers.utils import get_json_schema_from_tools
+from vllm.tool_parsers.utils import (
+    get_required_tool_json_schema,
+    parse_required_tool_json,
+)
 from vllm.utils import random_uuid
 from vllm.utils.collection_utils import as_list
 
@@ -822,20 +824,13 @@ class OpenAIServingResponses(OpenAIServing):
     @staticmethod
     def _required_function_tool_json_schema(request: ResponsesRequest) -> dict:
         """Build the JSON schema used to force required function calls."""
-        json_schema = get_json_schema_from_tools(
-            tool_choice=request.tool_choice,
-            tools=deepcopy(request.tools),
-        )
-        if json_schema is None:
-            raise ValueError("tool_choice='required' requires function tools.")
-        json_schema = cast(dict[str, Any], json_schema)
-
         max_items = request.max_tool_calls
         if request.parallel_tool_calls is False:
             max_items = min(max_items, 1) if max_items is not None else 1
-        if max_items is not None:
-            json_schema["maxItems"] = max_items
-        return json_schema
+        return get_required_tool_json_schema(
+            tools=request.tools,
+            max_items=max_items,
+        )
 
     def _apply_harmony_required_function_tool_schema(
         self,
@@ -856,32 +851,7 @@ class OpenAIServingResponses(OpenAIServing):
         text: str,
     ) -> list[FunctionDefinition]:
         """Parse constrained JSON into function-call definitions."""
-        try:
-            tool_calls = TypeAdapter(list[FunctionDefinition]).validate_json(text)
-        except ValidationError as exc:
-            raise ValueError(
-                "Failed to parse required tool-choice output as tool-call JSON."
-            ) from exc
-        if not tool_calls:
-            raise ValueError(
-                "Required tool-choice output did not contain any tool calls."
-            )
-
-        allowed_tool_names = {
-            tool.name for tool in request.tools if isinstance(tool, FunctionTool)
-        }
-        for tool_call in tool_calls:
-            if tool_call.name not in allowed_tool_names:
-                raise ValueError(
-                    "Required tool-choice output referenced an unknown tool: "
-                    f"{tool_call.name!r}."
-                )
-            if tool_call.parameters is None:
-                raise ValueError(
-                    "Required tool-choice output did not include object "
-                    f"parameters for tool {tool_call.name!r}."
-                )
-        return tool_calls
+        return parse_required_tool_json(text=text, tools=request.tools)
 
     def _make_harmony_required_function_call_items(
         self,
